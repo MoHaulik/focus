@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>WebXR AR Focus Trainer</title>
+  <title>WebXR Focus Trainer</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
@@ -16,7 +16,7 @@
       position: absolute;
       top: 20px;
       left: 20px;
-      z-index: 2;
+      z-index: 1;
     }
     #start-button {
       padding: 12px 24px;
@@ -45,191 +45,376 @@
       backdrop-filter: blur(5px);
       box-shadow: 0 4px 6px rgba(0,0,0,0.1);
     }
-    /* full-screen dimming overlay */
-    #dimOverlay {
+    #timer {
       position: absolute;
-      top: 0; left: 0;
-      width: 100%; height: 100%;
-      background: black;
-      opacity: 0;
-      pointer-events: none;
-      transition: opacity 0.5s;
-      z-index: 1;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 24px;
+      color: white;
+      background: rgba(0, 0, 0, 0.5);
+      padding: 10px 20px;
+      border-radius: 20px;
+      display: none;
+      z-index: 2;
     }
   </style>
 </head>
 <body>
   <div id="overlay">
-    <button id="start-button">Start AR Focus Trainer</button>
+    <button id="start-button">Start Focus Trainer</button>
     <div id="status"></div>
   </div>
-  <div id="dimOverlay"></div>
-
+  <div id="timer"></div>
+  
   <script type="module">
     import * as THREE from 'https://unpkg.com/three@0.150.1/build/three.module.js';
+    import { ARButton } from 'https://unpkg.com/three@0.150.1/examples/jsm/webxr/ARButton.js';
 
     let camera, scene, renderer;
     let controller;
-    let reticle, hitTestSource = null;
-    let dotPlaced = false, focusActive = false;
-    let focusStartTime = 0, lastRemaining = -1;
-    const focusDuration = 120; // seconds
-    let dotMesh;
+    let focusDot = null;
+    let focusSession = null;
+    let raycaster = new THREE.Raycaster();
+    let tempMatrix = new THREE.Matrix4();
+    let dimOverlay = null;
+    let timer = null;
+    let timerElement = document.getElementById('timer');
+    let focusStartTime = 0;
+    let focusDuration = 120; // seconds
+    let isLookingAtDot = false;
+    let lookTimer = 0;
+    let isPlacementMode = true;
 
+    // Focus detection variables
+    let raycasterDirection = new THREE.Vector3();
+    let cameraPosition = new THREE.Vector3();
+    let dotPosition = new THREE.Vector3();
+    
     init();
 
     function init() {
+      // Scene setup
       scene = new THREE.Scene();
-      camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.01, 20);
+      camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
 
+      // Renderer setup
       renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
       renderer.setSize(window.innerWidth, window.innerHeight);
       renderer.xr.enabled = true;
       renderer.setClearColor(0x000000, 0);
       document.body.appendChild(renderer.domElement);
 
-      scene.add(new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1));
+      // Lighting
+      const ambientLight = new THREE.AmbientLight(0xffffff, 1.5);
+      scene.add(ambientLight);
 
-      // transparent white dot reticle
-      const geom = new THREE.SphereGeometry(0.03, 16, 16);
-      const mat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.5 });
-      reticle = new THREE.Mesh(geom, mat);
-      reticle.matrixAutoUpdate = false;
-      reticle.visible = false;
-      scene.add(reticle);
+      // Start button event
+      document.getElementById('start-button').addEventListener('click', () => {
+        if (navigator.xr) {
+          navigator.xr.isSessionSupported('immersive-ar').then((supported) => {
+            if (supported) {
+              const sessionInit = { 
+                requiredFeatures: ['hit-test'],
+                optionalFeatures: ['dom-overlay'], 
+                domOverlay: { root: document.body } 
+              };
+              navigator.xr.requestSession('immersive-ar', sessionInit).then(onSessionStarted);
+            } else {
+              updateStatus('WebXR AR session is not supported on this device.');
+            }
+          });
+        } else {
+          updateStatus('WebXR is not supported in this browser.');
+        }
+      });
 
-      document.getElementById('start-button')
-        .addEventListener('click', startAR);
-
+      // Handle window resize
       window.addEventListener('resize', onWindowResize);
     }
 
-    function updateStatus(msg) {
-      const s = document.getElementById('status');
-      s.style.display = 'block';
-      s.textContent = msg;
+    function updateStatus(message) {
+      const statusElement = document.getElementById('status');
+      statusElement.style.display = 'block';
+      statusElement.textContent = message;
     }
 
     function onWindowResize() {
-      camera.aspect = window.innerWidth/window.innerHeight;
+      camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(window.innerWidth, window.innerHeight);
     }
 
-    function startAR() {
-      if (!navigator.xr) {
-        return updateStatus('WebXR not supported.');
-      }
-      navigator.xr.isSessionSupported('immersive-ar').then(supported => {
-        if (!supported) {
-          updateStatus('AR not supported on this device.');
-        } else {
-          navigator.xr.requestSession('immersive-ar', {
-            requiredFeatures: ['hit-test','dom-overlay'],
-            domOverlay: { root: document.body }
-          }).then(onSessionStarted);
-        }
-      });
-    }
-
     function onSessionStarted(session) {
+      // Set up XR session
+      renderer.xr.setReferenceSpaceType('local');
       renderer.xr.setSession(session);
-      session.addEventListener('end', onSessionEnded);
-
-      session.requestReferenceSpace('viewer').then(refSpace =>
-        session.requestHitTestSource({ space: refSpace })
-          .then(source => hitTestSource = source)
-      );
-
+      
+      // Hide button and show status
       document.getElementById('start-button').style.display = 'none';
-      updateStatus('Scan surface to place focus dot.');
+      updateStatus('Touch screen to place focus dot in your environment');
 
-      controller = renderer.xr.getController(0);
-      controller.addEventListener('select', onSelect);
-      scene.add(controller);
+      // Set up controller for interaction
+      setupController(session);
 
+      // Create dim overlay (invisible initially)
+      createDimOverlay();
+      
+      // Start animation loop
       renderer.setAnimationLoop(render);
+
+      // Handle session end
+      session.addEventListener('end', onSessionEnd);
     }
 
-    function onSessionEnded() {
-      updateStatus('AR session ended.');
+    function onSessionEnd() {
+      updateStatus('AR session ended');
       document.getElementById('start-button').style.display = 'block';
-      hitTestSource = null;
-      reticle.visible = false;
-      dotPlaced = focusActive = false;
-      document.getElementById('dimOverlay').style.opacity = 0;
-      lastRemaining = -1;
+      timerElement.style.display = 'none';
+    }
+
+    function createFocusDot(position) {
+      // Create a semi-transparent white dot
+      const geometry = new THREE.SphereGeometry(0.03, 32, 32);
+      const material = new THREE.MeshBasicMaterial({
+        color: 0xffffff,
+        transparent: true,
+        opacity: 0.7
+      });
+      focusDot = new THREE.Mesh(geometry, material);
+      focusDot.position.copy(position);
+      scene.add(focusDot);
+      
+      // Add a subtle pulsing effect
+      const pulseGeometry = new THREE.SphereGeometry(0.035, 32, 32);
+      const pulseMaterial = new THREE.MeshBasicMaterial({
+        color: 0xffffff,
+        transparent: true,
+        opacity: 0.3
+      });
+      const pulseEffect = new THREE.Mesh(pulseGeometry, pulseMaterial);
+      pulseEffect.userData.pulseFactor = 0;
+      focusDot.add(pulseEffect);
+      focusDot.userData.pulseEffect = pulseEffect;
+      
+      updateStatus('Tap on the dot to start focus training');
+      isPlacementMode = false;
+    }
+
+    function createDimOverlay() {
+      // Create a full-view overlay to dim the environment during focus mode
+      const geometry = new THREE.SphereGeometry(10, 32, 32);
+      geometry.scale(-1, 1, 1); // Make it face inward
+      
+      const material = new THREE.MeshBasicMaterial({
+        color: 0x000000,
+        transparent: true,
+        opacity: 0, // Start invisible
+        side: THREE.BackSide
+      });
+      
+      dimOverlay = new THREE.Mesh(geometry, material);
+      scene.add(dimOverlay);
+    }
+
+    function setupController(session) {
+      // Create controller for interaction
+      controller = renderer.xr.getController(0);
+      controller.addEventListener('connected', (event) => {
+        const xrInputSource = event.data;
+      });
+      
+      // Handle select events for placing and activating dot
+      controller.addEventListener('select', onSelect);
+      
+      scene.add(controller);
+      
+      // Add a visual line for aiming
+      const lineGeometry = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(0, 0, 0),
+        new THREE.Vector3(0, 0, -5)
+      ]);
+      
+      const lineMaterial = new THREE.LineBasicMaterial({
+        color: 0x00ffff,
+        transparent: true,
+        opacity: 0.5
+      });
+      
+      const line = new THREE.Line(lineGeometry, lineMaterial);
+      controller.add(line);
     }
 
     function onSelect() {
-      if (!dotPlaced && reticle.visible) {
-        // place the dot
-        dotMesh = reticle.clone();
-        dotMesh.matrixAutoUpdate = false;
-        dotMesh.applyMatrix4(reticle.matrix);
-        scene.add(dotMesh);
-
-        dotPlaced = true;
-        reticle.visible = false;
-
-        // DIM SLIGHTLY upon placement
-        document.getElementById('dimOverlay').style.opacity = 0.2;
-
-        updateStatus('Dot placed! Tap dot again to start 120 s focus.');
-      }
-      else if (dotPlaced && !focusActive) {
-        // detect tap on the placed dot
-        const tempMat = new THREE.Matrix4().extractRotation(controller.matrixWorld);
-        const ray = new THREE.Raycaster();
-        ray.ray.origin.setFromMatrixPosition(controller.matrixWorld);
-        ray.ray.direction.set(0, 0, -1).applyMatrix4(tempMat);
-
-        const hits = ray.intersectObject(dotMesh);
-        if (hits.length) startFocus();
+      if (isPlacementMode) {
+        // Place the dot where the controller is pointing
+        const controllerPosition = new THREE.Vector3();
+        controller.getWorldPosition(controllerPosition);
+        
+        const controllerDirection = new THREE.Vector3(0, 0, -1);
+        controllerDirection.applyQuaternion(controller.quaternion);
+        
+        // Place the dot 2 meters in front
+        const dotPosition = new THREE.Vector3().copy(controllerPosition)
+          .add(controllerDirection.multiplyScalar(2));
+        
+        createFocusDot(dotPosition);
+      } 
+      else if (focusDot && !focusSession) {
+        // Check if controller is pointing at the dot
+        tempMatrix.identity().extractRotation(controller.matrixWorld);
+        raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
+        raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tempMatrix);
+        
+        const intersects = raycaster.intersectObject(focusDot);
+        
+        if (intersects.length > 0) {
+          startFocusSession();
+        }
       }
     }
 
-    function startFocus() {
-      focusActive = true;
-      focusStartTime = performance.now();
-
-      // DIM MORE for focus
-      document.getElementById('dimOverlay').style.opacity = 0.5;
-
-      updateStatus(`Focus: ${focusDuration} s remaining`);
+    function startFocusSession() {
+      focusSession = {
+        startTime: Date.now(),
+        duration: focusDuration * 1000, // convert to milliseconds
+        active: true
+      };
+      
+      // Show timer
+      timerElement.style.display = 'block';
+      updateTimer(focusDuration);
+      
+      // Dim the environment
+      dimEnvironment(true);
+      
+      updateStatus('Focus session started. Keep your gaze on the dot.');
     }
 
-    function endFocus() {
-      updateStatus('Focus complete! Well done.');
-      renderer.xr.getSession().end();
+    function endFocusSession(completed) {
+      focusSession = null;
+      
+      // Hide timer
+      timerElement.style.display = 'none';
+      
+      // Restore environment brightness
+      dimEnvironment(false);
+      
+      if (completed) {
+        updateStatus('Focus training completed successfully! Tap the dot to try again.');
+      } else {
+        updateStatus('Focus training interrupted. Tap the dot to try again.');
+      }
+    }
+
+    function dimEnvironment(dim) {
+      // Animate the opacity change of the dim overlay
+      const targetOpacity = dim ? 0.5 : 0;
+      const duration = 1000; // milliseconds
+      const startTime = Date.now();
+      const startOpacity = dimOverlay.material.opacity;
+      
+      function animate() {
+        const elapsed = Date.now() - startTime;
+        const progress = Math.min(elapsed / duration, 1);
+        
+        dimOverlay.material.opacity = startOpacity + (targetOpacity - startOpacity) * progress;
+        
+        if (progress < 1) {
+          requestAnimationFrame(animate);
+        }
+      }
+      
+      animate();
+    }
+
+    function updateTimer(seconds) {
+      const minutes = Math.floor(seconds / 60);
+      const remainingSeconds = Math.floor(seconds % 60);
+      timerElement.textContent = `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
+    }
+
+    function checkFocusDirection() {
+      if (!focusDot || !focusSession || !focusSession.active) return false;
+      
+      // Get current camera position and direction
+      camera.getWorldPosition(cameraPosition);
+      camera.getWorldDirection(raycasterDirection);
+      
+      // Get dot position
+      focusDot.getWorldPosition(dotPosition);
+      
+      // Calculate direction to dot
+      const directionToDot = new THREE.Vector3().subVectors(dotPosition, cameraPosition).normalize();
+      
+      // Calculate angle between camera direction and direction to dot
+      const angle = raycasterDirection.angleTo(directionToDot) * (180 / Math.PI);
+      
+      // Consider looking at dot if within 5 degrees
+      return angle < 5;
     }
 
     function render(timestamp, frame) {
-      if (frame && hitTestSource && !dotPlaced) {
-        const refSpace = renderer.xr.getReferenceSpace();
-        const hits = frame.getHitTestResults(hitTestSource);
-        if (hits.length) {
-          const pose = hits[0].getPose(refSpace).transform.matrix;
-          reticle.visible = true;
-          reticle.matrix.fromArray(pose);
-        } else {
-          reticle.visible = false;
+      if (frame) {
+        const referenceSpace = renderer.xr.getReferenceSpace();
+        const session = renderer.xr.getSession();
+        
+        // Pulse effect animation for focus dot
+        if (focusDot) {
+          const pulseEffect = focusDot.userData.pulseEffect;
+          pulseEffect.userData.pulseFactor += 0.02;
+          const scale = 1 + 0.1 * Math.sin(pulseEffect.userData.pulseFactor);
+          pulseEffect.scale.set(scale, scale, scale);
+        }
+        
+        // Focus session logic
+        if (focusSession && focusSession.active) {
+          const elapsed = Date.now() - focusSession.startTime;
+          const remaining = Math.max(0, (focusSession.duration - elapsed) / 1000);
+          
+          updateTimer(remaining);
+          
+          // Check if user is looking at the dot
+          const currentlyLooking = checkFocusDirection();
+          
+          if (currentlyLooking) {
+            if (!isLookingAtDot) {
+              // Just started looking at the dot
+              isLookingAtDot = true;
+              lookTimer = 0;
+              if (focusDot) {
+                focusDot.material.color.set(0x00ff00); // Green when looking
+              }
+            } else {
+              // Continue looking, increment timer
+              lookTimer += 1/60; // Assuming 60fps
+            }
+          } else {
+            if (isLookingAtDot) {
+              // Just stopped looking
+              isLookingAtDot = false;
+              if (focusDot) {
+                focusDot.material.color.set(0xff0000); // Red when not looking
+                // Allow a short grace period before interrupting
+                setTimeout(() => {
+                  if (!isLookingAtDot) {
+                    focusDot.material.color.set(0xffffff); // Reset color
+                  }
+                }, 300);
+              }
+            }
+          }
+          
+          // Check if focus session is complete
+          if (remaining <= 0) {
+            if (focusDot) {
+              focusDot.material.color.set(0xffffff); // Reset color
+            }
+            endFocusSession(true);
+          }
         }
       }
-
-      if (focusActive) {
-        const elapsed = (performance.now() - focusStartTime) / 1000;
-        const remaining = Math.max(0, Math.ceil(focusDuration - elapsed));
-        if (remaining !== lastRemaining) {
-          lastRemaining = remaining;
-          updateStatus(`Focus: ${remaining} s remaining`);
-        }
-        if (elapsed >= focusDuration) {
-          focusActive = false;
-          endFocus();
-        }
-      }
-
+      
       renderer.render(scene, camera);
     }
   </script>
