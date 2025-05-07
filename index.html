@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>WebXR AR Focus Trainer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <style>
+    body { 
+      margin: 0; 
+      overflow: hidden;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    }
+    #overlay {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      z-index: 2;
+    }
+    #start-button {
+      padding: 12px 24px;
+      font-size: 18px;
+      background: rgba(72, 118, 255, 0.8);
+      color: white;
+      border: none;
+      border-radius: 30px;
+      box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+      cursor: pointer;
+      transition: all 0.3s ease;
+    }
+    #start-button:hover {
+      background: rgba(72, 118, 255, 1);
+      transform: translateY(-2px);
+      box-shadow: 0 6px 12px rgba(0,0,0,0.3);
+    }
+    #status {
+      margin-top: 15px;
+      font-size: 16px;
+      background: rgba(0, 0, 0, 0.5);
+      color: white;
+      padding: 10px 15px;
+      border-radius: 12px;
+      display: none;
+      backdrop-filter: blur(5px);
+      box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    }
+    /* full-screen dimming overlay */
+    #dimOverlay {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      background: black;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.5s;
+      z-index: 1;
+    }
+  </style>
+</head>
+<body>
+  <div id="overlay">
+    <button id="start-button">Start AR Focus Trainer</button>
+    <div id="status"></div>
+  </div>
+  <div id="dimOverlay"></div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.150.1/build/three.module.js';
+
+    let camera, scene, renderer;
+    let controller;
+    let reticle, hitTestSource = null;
+    let dotPlaced = false, focusActive = false;
+    let focusStartTime = 0, lastRemaining = -1;
+    const focusDuration = 120; // seconds
+    let dotMesh;
+
+    init();
+
+    function init() {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.01, 20);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.xr.enabled = true;
+      renderer.setClearColor(0x000000, 0);
+      document.body.appendChild(renderer.domElement);
+
+      scene.add(new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1));
+
+      // transparent white dot reticle
+      const geom = new THREE.SphereGeometry(0.03, 16, 16);
+      const mat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.5 });
+      reticle = new THREE.Mesh(geom, mat);
+      reticle.matrixAutoUpdate = false;
+      reticle.visible = false;
+      scene.add(reticle);
+
+      document.getElementById('start-button')
+        .addEventListener('click', startAR);
+
+      window.addEventListener('resize', onWindowResize);
+    }
+
+    function updateStatus(msg) {
+      const s = document.getElementById('status');
+      s.style.display = 'block';
+      s.textContent = msg;
+    }
+
+    function onWindowResize() {
+      camera.aspect = window.innerWidth/window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    function startAR() {
+      if (!navigator.xr) {
+        return updateStatus('WebXR not supported.');
+      }
+      navigator.xr.isSessionSupported('immersive-ar').then(supported => {
+        if (!supported) {
+          updateStatus('AR not supported on this device.');
+        } else {
+          navigator.xr.requestSession('immersive-ar', {
+            requiredFeatures: ['hit-test','dom-overlay'],
+            domOverlay: { root: document.body }
+          }).then(onSessionStarted);
+        }
+      });
+    }
+
+    function onSessionStarted(session) {
+      renderer.xr.setSession(session);
+      session.addEventListener('end', onSessionEnded);
+
+      session.requestReferenceSpace('viewer').then(refSpace =>
+        session.requestHitTestSource({ space: refSpace })
+          .then(source => hitTestSource = source)
+      );
+
+      document.getElementById('start-button').style.display = 'none';
+      updateStatus('Scan surface to place focus dot.');
+
+      controller = renderer.xr.getController(0);
+      controller.addEventListener('select', onSelect);
+      scene.add(controller);
+
+      renderer.setAnimationLoop(render);
+    }
+
+    function onSessionEnded() {
+      updateStatus('AR session ended.');
+      document.getElementById('start-button').style.display = 'block';
+      hitTestSource = null;
+      reticle.visible = false;
+      dotPlaced = focusActive = false;
+      document.getElementById('dimOverlay').style.opacity = 0;
+      lastRemaining = -1;
+    }
+
+    function onSelect() {
+      if (!dotPlaced && reticle.visible) {
+        // place the dot
+        dotMesh = reticle.clone();
+        dotMesh.matrixAutoUpdate = false;
+        dotMesh.applyMatrix4(reticle.matrix);
+        scene.add(dotMesh);
+
+        dotPlaced = true;
+        reticle.visible = false;
+
+        // DIM SLIGHTLY upon placement
+        document.getElementById('dimOverlay').style.opacity = 0.2;
+
+        updateStatus('Dot placed! Tap dot again to start 120 s focus.');
+      }
+      else if (dotPlaced && !focusActive) {
+        // detect tap on the placed dot
+        const tempMat = new THREE.Matrix4().extractRotation(controller.matrixWorld);
+        const ray = new THREE.Raycaster();
+        ray.ray.origin.setFromMatrixPosition(controller.matrixWorld);
+        ray.ray.direction.set(0, 0, -1).applyMatrix4(tempMat);
+
+        const hits = ray.intersectObject(dotMesh);
+        if (hits.length) startFocus();
+      }
+    }
+
+    function startFocus() {
+      focusActive = true;
+      focusStartTime = performance.now();
+
+      // DIM MORE for focus
+      document.getElementById('dimOverlay').style.opacity = 0.5;
+
+      updateStatus(`Focus: ${focusDuration} s remaining`);
+    }
+
+    function endFocus() {
+      updateStatus('Focus complete! Well done.');
+      renderer.xr.getSession().end();
+    }
+
+    function render(timestamp, frame) {
+      if (frame && hitTestSource && !dotPlaced) {
+        const refSpace = renderer.xr.getReferenceSpace();
+        const hits = frame.getHitTestResults(hitTestSource);
+        if (hits.length) {
+          const pose = hits[0].getPose(refSpace).transform.matrix;
+          reticle.visible = true;
+          reticle.matrix.fromArray(pose);
+        } else {
+          reticle.visible = false;
+        }
+      }
+
+      if (focusActive) {
+        const elapsed = (performance.now() - focusStartTime) / 1000;
+        const remaining = Math.max(0, Math.ceil(focusDuration - elapsed));
+        if (remaining !== lastRemaining) {
+          lastRemaining = remaining;
+          updateStatus(`Focus: ${remaining} s remaining`);
+        }
+        if (elapsed >= focusDuration) {
+          focusActive = false;
+          endFocus();
+        }
+      }
+
+      renderer.render(scene, camera);
+    }
+  </script>
+</body>
+</html>
